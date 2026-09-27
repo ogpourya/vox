@@ -25,6 +25,7 @@ const maxRetries = 10
 func main() {
 	lang := flag.String("lang", "en-US", "Language code (e.g. en-US, fr, es)")
 	voice := flag.String("voice", "en-US-Casual-K", "TTS voice name")
+	rate := flag.Float64("rate", 1.0, "TTS speaking rate (0.25-4.0)")
 	out := flag.String("o", "output.mp3", "TTS output file (saves instead of playing)")
 	debug := flag.Bool("debug", false, "Debug mode - show progress and errors")
 	help := flag.Bool("help", false, "Show help")
@@ -41,7 +42,7 @@ func main() {
 			if !explicitFlag("lang") {
 				*lang = langFromVoice(*voice)
 			}
-			runTTS(strings.Join(flag.Args(), " "), *voice, *lang, *out, explicitFlag("o"), *debug)
+			runTTS(strings.Join(flag.Args(), " "), *voice, *lang, *out, *rate, explicitFlag("o"), *debug)
 			return
 		}
 	}
@@ -276,13 +277,17 @@ func isSTTInput(args []string) bool {
 	return false
 }
 
-func runTTS(text, voice, lang, out string, save, debug bool) {
+func runTTS(text, voice, lang, out string, rate float64, save, debug bool) {
 	if strings.TrimSpace(text) == "" {
 		fmt.Fprintln(os.Stderr, "Error: no text supplied.")
 		os.Exit(1)
 	}
+	if rate < 0.25 || rate > 4.0 {
+		fmt.Fprintln(os.Stderr, "Error: rate must be between 0.25 and 4.0.")
+		os.Exit(1)
+	}
 
-	audio, err := tts.Synthesize(text, voice, lang)
+	audio, err := tts.Synthesize(text, voice, lang, rate)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -393,6 +398,8 @@ Options:
   -voice string
         TTS voice name (default "en-US-Casual-K")
         Voices: https://docs.cloud.google.com/text-to-speech/docs/list-voices-and-types
+  -rate float
+        TTS speaking rate 0.25-4.0 (default 1.0)
   -o string
         TTS output file (saves instead of playing, default "output.mp3")
   -debug

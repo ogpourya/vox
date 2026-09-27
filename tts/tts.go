@@ -21,16 +21,18 @@ type ttsRequest struct {
 		Name         string `json:"name"`
 	} `json:"voice"`
 	AudioConfig struct {
-		AudioEncoding string `json:"audioEncoding"`
+		AudioEncoding string  `json:"audioEncoding"`
+		SpeakingRate  float64 `json:"speakingRate"`
 	} `json:"audioConfig"`
 }
 
-func Synthesize(text, voice, lang string) ([]byte, error) {
+func Synthesize(text, voice, lang string, rate float64) ([]byte, error) {
 	var reqBody ttsRequest
 	reqBody.Input.Text = text
 	reqBody.Voice.LanguageCode = lang
 	reqBody.Voice.Name = voice
 	reqBody.AudioConfig.AudioEncoding = "MP3"
+	reqBody.AudioConfig.SpeakingRate = rate
 
 	data, err := json.Marshal(reqBody)
 	if err != nil {
