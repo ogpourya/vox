@@ -70,7 +70,7 @@ fi
 # Test 7: TTS synthesis + STT round-trip
 echo "Test 7: TTS round-trip"
 TTS_OUT="$(mktemp /tmp/opencode/vox_tts_XXXXXX.mp3)"
-$BIN -no-play -o "$TTS_OUT" 'hey there buddy' > /dev/null
+$BIN -o "$TTS_OUT" 'hey there buddy' > /dev/null
 if [[ ! -s "$TTS_OUT" ]]; then
   echo "Failed: TTS output file empty or missing"
   exit 1

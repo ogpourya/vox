@@ -25,8 +25,7 @@ const maxRetries = 10
 func main() {
 	lang := flag.String("lang", "en-US", "Language code (e.g. en-US, fr, es)")
 	voice := flag.String("voice", "en-US-Casual-K", "TTS voice name")
-	out := flag.String("o", "output.mp3", "TTS output file")
-	noPlay := flag.Bool("no-play", false, "Don't play TTS audio")
+	out := flag.String("o", "output.mp3", "TTS output file (saves instead of playing)")
 	debug := flag.Bool("debug", false, "Debug mode - show progress and errors")
 	help := flag.Bool("help", false, "Show help")
 	flag.Parse()
@@ -39,7 +38,10 @@ func main() {
 	if !isStdinPiped() {
 		// No stdin: plain text means TTS, audio files mean STT.
 		if flag.NArg() > 0 && !isSTTInput(flag.Args()) {
-			runTTS(strings.Join(flag.Args(), " "), *voice, *lang, *out, *noPlay, *debug)
+			if !explicitFlag("lang") {
+				*lang = langFromVoice(*voice)
+			}
+			runTTS(strings.Join(flag.Args(), " "), *voice, *lang, *out, explicitFlag("o"), *debug)
 			return
 		}
 	}
@@ -236,13 +238,24 @@ func isStdinPiped() bool {
 	return (stdinInfo.Mode() & os.ModeCharDevice) == 0
 }
 
-func allFilesExist(args []string) bool {
-	for _, a := range args {
-		if _, err := os.Stat(a); os.IsNotExist(err) {
-			return false
+func explicitFlag(name string) bool {
+	set := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
 		}
+	})
+	return set
+}
+
+// langFromVoice derives the language code from a voice name
+// (e.g. en-IN-Chirp-HD-D -> en-IN). Falls back to en-US.
+func langFromVoice(voice string) string {
+	parts := strings.Split(voice, "-")
+	if len(parts) >= 2 && parts[0] != "" && parts[1] != "" {
+		return parts[0] + "-" + parts[1]
 	}
-	return true
+	return "en-US"
 }
 
 // isSTTInput reports whether args look like audio files (existing path or
@@ -263,7 +276,7 @@ func isSTTInput(args []string) bool {
 	return false
 }
 
-func runTTS(text, voice, lang, out string, noPlay, debug bool) {
+func runTTS(text, voice, lang, out string, save, debug bool) {
 	if strings.TrimSpace(text) == "" {
 		fmt.Fprintln(os.Stderr, "Error: no text supplied.")
 		os.Exit(1)
@@ -275,16 +288,35 @@ func runTTS(text, voice, lang, out string, noPlay, debug bool) {
 		os.Exit(1)
 	}
 
-	if err := os.WriteFile(out, audio, 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: failed to write %s: %v\n", out, err)
-		os.Exit(1)
-	}
-	fmt.Printf("Voice : %s\nOutput: %s\nCreated: %s\n", voice, out, out)
-
-	if noPlay {
+	// Save mode (-o given): write file, no playback.
+	if save {
+		if err := os.WriteFile(out, audio, 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: failed to write %s: %v\n", out, err)
+			os.Exit(1)
+		}
+		fmt.Printf("Voice : %s\nCreated: %s\n", voice, out)
 		return
 	}
-	playAudio(out, debug)
+
+	// Play mode (no -o): temp file, play, clean up.
+	tmp, err := os.CreateTemp("", "vox_play_*.mp3")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(audio); err != nil {
+		tmp.Close()
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	tmp.Close()
+
+	if debug {
+		fmt.Printf("Voice : %s\n", voice)
+	}
+	playAudio(tmpName, debug)
 }
 
 func playAudio(file string, debug bool) {
@@ -357,14 +389,12 @@ Usage:
 
 Options:
   -lang string
-        Language code (default "en-US")
+        Language code (default matches -voice)
   -voice string
         TTS voice name (default "en-US-Casual-K")
         Voices: https://docs.cloud.google.com/text-to-speech/docs/list-voices-and-types
   -o string
-        TTS output file (default "output.mp3")
-  -no-play
-        Don't play TTS audio
+        TTS output file (saves instead of playing, default "output.mp3")
   -debug
         Show detailed progress
   -help
