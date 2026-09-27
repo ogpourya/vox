@@ -14,7 +14,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ogpourya/audio2json/transcribe"
+	"github.com/ogpourya/vox/transcribe"
+	"github.com/ogpourya/vox/tts"
 )
 
 const chunkDuration = 15.0 
@@ -22,9 +23,10 @@ const maxConcurrentUploads = 10
 const maxRetries = 10 
 
 func main() {
-	checkFFmpegAndProbe()
-
 	lang := flag.String("lang", "en-US", "Language code (e.g. en-US, fr, es)")
+	voice := flag.String("voice", "en-US-Casual-K", "TTS voice name")
+	out := flag.String("o", "output.mp3", "TTS output file")
+	noPlay := flag.Bool("no-play", false, "Don't play TTS audio")
 	debug := flag.Bool("debug", false, "Debug mode - show progress and errors")
 	help := flag.Bool("help", false, "Show help")
 	flag.Parse()
@@ -33,6 +35,16 @@ func main() {
 		printHelp()
 		return
 	}
+
+	if !isStdinPiped() {
+		// No stdin: plain text means TTS, audio files mean STT.
+		if flag.NArg() > 0 && !isSTTInput(flag.Args()) {
+			runTTS(strings.Join(flag.Args(), " "), *voice, *lang, *out, *noPlay, *debug)
+			return
+		}
+	}
+
+	checkFFmpegAndProbe()
 
 	files := getFilesFromArgsOrStdin()
 	if len(files) == 0 {
@@ -94,7 +106,7 @@ func main() {
 }
 
 func processFileFast(file, lang string, debug bool) (*string, error) {
-	tmpDir, err := os.MkdirTemp("", "a2j_chunks_*")
+	tmpDir, err := os.MkdirTemp("", "vox_chunks_*")
 	if err != nil {
 		return nil, fmt.Errorf("failed to make temp dir: %w", err)
 	}
@@ -219,6 +231,80 @@ func checkFFmpegAndProbe() {
 	}
 }
 
+func isStdinPiped() bool {
+	stdinInfo, _ := os.Stdin.Stat()
+	return (stdinInfo.Mode() & os.ModeCharDevice) == 0
+}
+
+func allFilesExist(args []string) bool {
+	for _, a := range args {
+		if _, err := os.Stat(a); os.IsNotExist(err) {
+			return false
+		}
+	}
+	return true
+}
+
+// isSTTInput reports whether args look like audio files (existing path or
+// audio extension) rather than text to speak.
+func isSTTInput(args []string) bool {
+	audioExts := []string{".mp3", ".wav", ".ogg", ".oga", ".m4a", ".aac", ".flac", ".opus", ".wma", ".aiff", ".aif", ".webm", ".mp4"}
+	for _, a := range args {
+		if _, err := os.Stat(a); err == nil {
+			return true
+		}
+		lower := strings.ToLower(a)
+		for _, ext := range audioExts {
+			if strings.HasSuffix(lower, ext) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func runTTS(text, voice, lang, out string, noPlay, debug bool) {
+	if strings.TrimSpace(text) == "" {
+		fmt.Fprintln(os.Stderr, "Error: no text supplied.")
+		os.Exit(1)
+	}
+
+	audio, err := tts.Synthesize(text, voice, lang)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := os.WriteFile(out, audio, 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: failed to write %s: %v\n", out, err)
+		os.Exit(1)
+	}
+	fmt.Printf("Voice : %s\nOutput: %s\nCreated: %s\n", voice, out, out)
+
+	if noPlay {
+		return
+	}
+	playAudio(out, debug)
+}
+
+func playAudio(file string, debug bool) {
+	var cmd *exec.Cmd
+	if _, err := exec.LookPath("ffplay"); err == nil {
+		cmd = exec.Command("ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", file)
+	} else if _, err := exec.LookPath("mpv"); err == nil {
+		cmd = exec.Command("mpv", "--no-video", file)
+	} else {
+		fmt.Fprintln(os.Stderr, "Warning: ffplay/mpv not found. Audio will not be played.")
+		return
+	}
+	if debug {
+		fmt.Println("Playing...")
+	}
+	if err := cmd.Run(); err != nil && debug {
+		fmt.Fprintf(os.Stderr, "Warning: playback failed: %v\n", err)
+	}
+}
+
 func getFilesFromArgsOrStdin() []string {
 	stdinInfo, _ := os.Stdin.Stat()
 	var files []string
@@ -261,14 +347,24 @@ func printJSON(data map[string]*string) {
 }
 
 func printHelp() {
-	fmt.Println(`audio2json - Fast Transcription
+	fmt.Println(`vox - Speech to text, text to speech
 
 Usage:
-  audio2json [options] file1 file2 ...
+  vox [options] file1 file2 ...
+        Transcribe audio files to JSON
+  vox [options] "text to speak"
+        Synthesize speech to an audio file
 
 Options:
   -lang string
         Language code (default "en-US")
+  -voice string
+        TTS voice name (default "en-US-Casual-K")
+        Voices: https://docs.cloud.google.com/text-to-speech/docs/list-voices-and-types
+  -o string
+        TTS output file (default "output.mp3")
+  -no-play
+        Don't play TTS audio
   -debug
         Show detailed progress
   -help

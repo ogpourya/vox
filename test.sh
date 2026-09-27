@@ -4,7 +4,7 @@ set -e
 
 echo "Starting tests..."
 
-BIN="go run audio2json.go"
+BIN="go run vox.go"
 
 # Test 1: No files given => should show help
 echo "Test 1: No files"
@@ -64,6 +64,23 @@ if [ $? -eq 0 ]; then
   echo "Passed: Reading files from stdin works"
 else
   echo "Failed: Reading files from stdin failed"
+  exit 1
+fi
+
+# Test 7: TTS synthesis + STT round-trip
+echo "Test 7: TTS round-trip"
+TTS_OUT="$(mktemp /tmp/opencode/vox_tts_XXXXXX.mp3)"
+$BIN -no-play -o "$TTS_OUT" 'hey there buddy' > /dev/null
+if [[ ! -s "$TTS_OUT" ]]; then
+  echo "Failed: TTS output file empty or missing"
+  exit 1
+fi
+output=$($BIN "$TTS_OUT")
+rm -f "$TTS_OUT"
+if echo "$output" | grep -iq "hey there buddy"; then
+  echo "Passed: TTS round-trip transcription matches"
+else
+  echo "Failed: TTS round-trip mismatch: $output"
   exit 1
 fi
 

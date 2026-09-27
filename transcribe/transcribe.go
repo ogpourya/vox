@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ogpourya/audio2json/config"
+	"github.com/ogpourya/vox/config"
 )
 
 func Transcribe(audioPath, lang string) (*string, error) {
@@ -19,7 +19,7 @@ func Transcribe(audioPath, lang string) (*string, error) {
 		return nil, fmt.Errorf("input audio file error: %w", err)
 	}
 
-	tmpWav, err := os.CreateTemp("", "audio2json_temp_*.wav")
+	tmpWav, err := os.CreateTemp("", "vox_temp_*.wav")
 	if err != nil {
 		return nil, fmt.Errorf("failed to create temp WAV file: %w", err)
 	}

@@ -1,3 +1,3 @@
-module github.com/ogpourya/audio2json
+module github.com/ogpourya/vox
 
 go 1.24.2
