@@ -2,25 +2,44 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/ogpourya/vox/transcribe"
 	"github.com/ogpourya/vox/tts"
 )
 
-const chunkDuration = 15.0 
-const maxConcurrentUploads = 10 
-const maxRetries = 10 
+const chunkDuration = 15.0
+const maxConcurrentUploads = 10
+const maxRetries = 10
+
+// maxConcurrentFiles caps simultaneous files (each spawns an ffmpeg split).
+const maxConcurrentFiles = 4
+
+// maxChunkWait bounds total backoff per chunk so sustained quota errors
+// fail in minutes, not tens of minutes.
+const maxChunkWait = 2 * time.Minute
+
+// uploadSem caps concurrent transcription uploads process-wide
+// (a per-file semaphore would multiply the cap by the file count).
+var uploadSem = make(chan struct{}, maxConcurrentUploads)
+
+// fileSem caps concurrent files for the same reason.
+var fileSem = make(chan struct{}, maxConcurrentFiles)
 
 func main() {
 	lang := flag.String("lang", "en-US", "Language code (e.g. en-US, fr, es)")
@@ -30,6 +49,11 @@ func main() {
 	debug := flag.Bool("debug", false, "Debug mode - show progress and errors")
 	help := flag.Bool("help", false, "Show help")
 	flag.Parse()
+
+	// Signal-aware context: Ctrl-C stops new work and aborts in-flight
+	// ffmpeg/uploads/sleeps instead of abandoning temp files.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	if *help {
 		printHelp()
@@ -42,7 +66,7 @@ func main() {
 			if !explicitFlag("lang") {
 				*lang = langFromVoice(*voice)
 			}
-			runTTS(strings.Join(flag.Args(), " "), *voice, *lang, *out, *rate, explicitFlag("o"), *debug)
+			runTTS(ctx, strings.Join(flag.Args(), " "), *voice, *lang, *out, *rate, explicitFlag("o"), *debug)
 			return
 		}
 	}
@@ -57,78 +81,98 @@ func main() {
 	files = uniqueFiles(files)
 
 	for _, f := range files {
-		if _, err := os.Stat(f); os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "Error: file not found: %s\n", f)
+		if _, err := os.Stat(f); err != nil {
+			if os.IsNotExist(err) {
+				fmt.Fprintf(os.Stderr, "Error: file not found: %s\n", f)
+			} else {
+				fmt.Fprintf(os.Stderr, "Error: cannot access file %s: %v\n", f, err)
+			}
 			os.Exit(1)
 		}
 	}
 
 	type fileResult struct {
-		filename string
-		text     *string
-		err      error
+		key  string
+		text *string
+		err  error
 	}
 
 	fileResultsChan := make(chan fileResult, len(files))
 	var wg sync.WaitGroup
 
 	startTotal := time.Now()
+	keys := resultKeys(files)
 
-	for _, file := range files {
+	for i, file := range files {
 		wg.Add(1)
-		go func(f string) {
+		go func(idx int, f string) {
 			defer wg.Done()
+			select {
+			case fileSem <- struct{}{}:
+				defer func() { <-fileSem }()
+			case <-ctx.Done():
+				fileResultsChan <- fileResult{key: keys[idx], err: ctx.Err()}
+				return
+			}
 			if *debug {
-				fmt.Printf("🚀 Starting file: %s\n", f)
+				fmt.Fprintf(os.Stderr, "🚀 Starting file: %s\n", f)
 			}
 
-			// We ignore the error here so we always get the text
-			text, _ := processFileFast(f, *lang, *debug)
-			
+			text, err := processFileFast(ctx, f, *lang, *debug)
+
 			fileResultsChan <- fileResult{
-				filename: filepath.Base(f),
-				text:     text,
-				err:      nil, // Force nil error so JSON is always generated
+				key:  keys[idx],
+				text: text,
+				err:  err,
 			}
-		}(file)
+		}(i, file)
 	}
 
 	wg.Wait()
 	close(fileResultsChan)
 
 	if *debug {
-		fmt.Printf("✅ Total time taken: %v\n", time.Since(startTotal))
+		fmt.Fprintf(os.Stderr, "✅ Total time taken: %v\n", time.Since(startTotal))
 	}
 
 	results := make(map[string]*string)
+	var failed []string
 	for res := range fileResultsChan {
-		results[res.filename] = res.text
+		results[res.key] = res.text
+		if res.err != nil {
+			failed = append(failed, res.key)
+			fmt.Fprintf(os.Stderr, "Error: %s: %v\n", res.key, res.err)
+		}
 	}
 
 	printJSON(results)
+
+	if len(failed) > 0 {
+		os.Exit(1)
+	}
 }
 
-func processFileFast(file, lang string, debug bool) (*string, error) {
+func processFileFast(ctx context.Context, file, lang string, debug bool) (*string, error) {
 	tmpDir, err := os.MkdirTemp("", "vox_chunks_*")
 	if err != nil {
 		return nil, fmt.Errorf("failed to make temp dir: %w", err)
 	}
-	defer os.RemoveAll(tmpDir) 
+	defer os.RemoveAll(tmpDir)
 
-	chunkPattern := filepath.Join(tmpDir, "chunk_%03d.wav")
-	
+	chunkPattern := filepath.Join(tmpDir, "chunk_%05d.wav")
+
 	if debug {
-		fmt.Printf("🔪 Splitting audio %s...\n", file)
+		fmt.Fprintf(os.Stderr, "🔪 Splitting audio %s...\n", file)
 	}
 
-	cmd := exec.Command("ffmpeg", 
-		"-v", "error", 
-		"-i", file, 
-		"-f", "segment", 
-		"-segment_time", fmt.Sprintf("%f", chunkDuration), 
-		"-c:a", "pcm_s16le", 
-		"-ar", "16000", 
-		"-ac", "1", 
+	cmd := exec.CommandContext(ctx, "ffmpeg",
+		"-v", "error",
+		"-i", file,
+		"-f", "segment",
+		"-segment_time", fmt.Sprintf("%f", chunkDuration),
+		"-c:a", "pcm_s16le",
+		"-ar", "16000",
+		"-ac", "1",
 		chunkPattern,
 	)
 
@@ -136,8 +180,11 @@ func processFileFast(file, lang string, debug bool) (*string, error) {
 		return nil, fmt.Errorf("ffmpeg splitting failed: %s", string(output))
 	}
 
+	entries, err := os.ReadDir(tmpDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list chunks: %w", err)
+	}
 	var chunks []string
-	entries, _ := os.ReadDir(tmpDir)
 	for _, e := range entries {
 		if !e.IsDir() && strings.HasSuffix(e.Name(), ".wav") {
 			chunks = append(chunks, filepath.Join(tmpDir, e.Name()))
@@ -154,46 +201,72 @@ func processFileFast(file, lang string, debug bool) (*string, error) {
 		text  string
 		err   error
 	}
-	
+
 	resultsChan := make(chan chunkResult, len(chunks))
 	var chunkWg sync.WaitGroup
 
-	sem := make(chan struct{}, maxConcurrentUploads)
-
 	for i, chunkPath := range chunks {
 		chunkWg.Add(1)
-		
+
 		go func(idx int, path string) {
 			defer chunkWg.Done()
-			sem <- struct{}{} 
-			defer func() { <-sem }()
+			select {
+			case uploadSem <- struct{}{}:
+				defer func() { <-uploadSem }()
+			case <-ctx.Done():
+				resultsChan <- chunkResult{index: idx, err: ctx.Err()}
+				return
+			}
 
 			var txt *string
 			var err error
+			var waited time.Duration
 
+		retry:
 			for attempt := 1; attempt <= maxRetries; attempt++ {
-				// Only log retries if it's NOT the silence error
-				// This keeps logs clean for expected silence
-				txt, err = transcribe.Transcribe(path, lang)
+				// Chunks are already 16kHz mono: no redundant re-encode.
+				txt, err = transcribe.TranscribeWAV(ctx, path, lang)
 				if err == nil {
 					break
 				}
-				
-				// If error is "no transcription", don't retry, just accept it's empty
-				if strings.Contains(err.Error(), "no transcription") {
-					err = nil 
-					empty := ""
-					txt = &empty
+
+				// Permanent failures (bad lang, bad audio) fail fast.
+				if !transcribe.IsRetryable(err) {
+					if debug {
+						fmt.Fprintf(os.Stderr, "❌ Chunk %d failed (not retrying): %v\n", idx, err)
+					}
 					break
 				}
 
-				if debug && attempt > 1 {
-					fmt.Printf("🔄 Retry %d/%d for chunk %d: %v\n", attempt, maxRetries, idx, err)
-				} 
-				
-				time.Sleep(time.Second * time.Duration(attempt))
+				if attempt == maxRetries {
+					break
+				}
+				wait := time.Second * time.Duration(attempt)
+				var apiErr *transcribe.APIError
+				if errors.As(err, &apiErr) && apiErr.RetryAfter > 0 {
+					wait = min(apiErr.RetryAfter, time.Minute)
+				}
+				// Jitter so concurrent chunks don't hammer the shared key in lockstep.
+				wait = wait/2 + time.Duration(rand.Int63n(int64(wait/2)+1))
+				if waited+wait > maxChunkWait {
+					if debug {
+						fmt.Fprintf(os.Stderr, "❌ Chunk %d giving up after %v of backoff: %v\n", idx, waited, err)
+					}
+					break
+				}
+				if debug {
+					fmt.Fprintf(os.Stderr, "🔄 Retry %d/%d for chunk %d in %v: %v\n", attempt+1, maxRetries, idx, wait, err)
+				}
+
+				select {
+				case <-ctx.Done():
+					err = ctx.Err()
+					break retry
+				case <-time.After(wait):
+					waited += wait
+				}
 			}
-			
+
 			res := chunkResult{index: idx, err: err}
 			if txt != nil {
 				res.text = *txt
@@ -207,23 +280,30 @@ func processFileFast(file, lang string, debug bool) (*string, error) {
 
 	orderedText := make([]string, len(chunks))
 	var errs []string
+	var firstErr error
 
 	for res := range resultsChan {
 		if res.err != nil {
 			errs = append(errs, fmt.Sprintf("chunk %d", res.index))
+			if firstErr == nil {
+				firstErr = res.err
+			}
 			// We just leave this index empty in orderedText
 		} else {
 			orderedText[res.index] = res.text
 		}
 	}
 
-	// CHANGED: We do NOT return error here anymore. 
-	// We just log warnings and return whatever text we managed to get.
+	if len(errs) == len(chunks) {
+		return nil, fmt.Errorf("failed to transcribe all %d chunks: %v", len(chunks), firstErr)
+	}
+
+	// Partial failures return what succeeded; total failure errors out above.
 	if len(errs) > 0 && debug {
 		log.Printf("⚠️ Warning: Failed to transcribe chunks: %v (skipping them)", errs)
 	}
 
-	fullText := strings.TrimSpace(strings.Join(orderedText, " "))
+	fullText := joinOrdered(orderedText)
 	return &fullText, nil
 }
 
@@ -235,8 +315,8 @@ func checkFFmpegAndProbe() {
 }
 
 func isStdinPiped() bool {
-	stdinInfo, _ := os.Stdin.Stat()
-	return (stdinInfo.Mode() & os.ModeCharDevice) == 0
+	stdinInfo, err := os.Stdin.Stat()
+	return err == nil && (stdinInfo.Mode()&os.ModeCharDevice) == 0
 }
 
 func explicitFlag(name string) bool {
@@ -259,13 +339,14 @@ func langFromVoice(voice string) string {
 	return "en-US"
 }
 
-// isSTTInput reports whether args look like audio files (existing path or
-// audio extension) rather than text to speak.
+// isSTTInput reports whether args look like audio files (existing regular
+// file or audio extension) rather than text to speak. Directories never
+// count: they cannot be transcribed.
 func isSTTInput(args []string) bool {
 	audioExts := []string{".mp3", ".wav", ".ogg", ".oga", ".m4a", ".aac", ".flac", ".opus", ".wma", ".aiff", ".aif", ".webm", ".mp4"}
 	for _, a := range args {
-		if _, err := os.Stat(a); err == nil {
-			return true
+		if strings.TrimSpace(a) == "" {
+			continue
 		}
 		lower := strings.ToLower(a)
 		for _, ext := range audioExts {
@@ -273,11 +354,14 @@ func isSTTInput(args []string) bool {
 				return true
 			}
 		}
+		if info, err := os.Stat(a); err == nil && info.Mode().IsRegular() {
+			return true
+		}
 	}
 	return false
 }
 
-func runTTS(text, voice, lang, out string, rate float64, save, debug bool) {
+func runTTS(ctx context.Context, text, voice, lang, out string, rate float64, save, debug bool) {
 	if strings.TrimSpace(text) == "" {
 		fmt.Fprintln(os.Stderr, "Error: no text supplied.")
 		os.Exit(1)
@@ -287,7 +371,7 @@ func runTTS(text, voice, lang, out string, rate float64, save, debug bool) {
 		os.Exit(1)
 	}
 
-	audio, err := tts.Synthesize(text, voice, lang, rate)
+	audio, err := tts.Synthesize(ctx, text, voice, lang, rate)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
@@ -321,15 +405,15 @@ func runTTS(text, voice, lang, out string, rate float64, save, debug bool) {
 	if debug {
 		fmt.Printf("Voice : %s\n", voice)
 	}
-	playAudio(tmpName, debug)
+	playAudio(ctx, tmpName, debug)
 }
 
-func playAudio(file string, debug bool) {
+func playAudio(ctx context.Context, file string, debug bool) {
 	var cmd *exec.Cmd
 	if _, err := exec.LookPath("ffplay"); err == nil {
-		cmd = exec.Command("ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", file)
+		cmd = exec.CommandContext(ctx, "ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", file)
 	} else if _, err := exec.LookPath("mpv"); err == nil {
-		cmd = exec.Command("mpv", "--no-video", file)
+		cmd = exec.CommandContext(ctx, "mpv", "--no-video", file)
 	} else {
 		fmt.Fprintln(os.Stderr, "Warning: ffplay/mpv not found. Audio will not be played.")
 		return
@@ -343,33 +427,76 @@ func playAudio(file string, debug bool) {
 }
 
 func getFilesFromArgsOrStdin() []string {
-	stdinInfo, _ := os.Stdin.Stat()
+	piped := isStdinPiped()
 	var files []string
 
-	if (stdinInfo.Mode() & os.ModeCharDevice) == 0 {
+	if flag.NArg() > 0 && piped {
+		fmt.Fprintln(os.Stderr, "Warning: stdin is piped; ignoring command-line arguments.")
+	}
+
+	if piped {
 		scanner := bufio.NewScanner(os.Stdin)
+		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if line != "" {
 				files = append(files, line)
 			}
 		}
+		if err := scanner.Err(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: error reading stdin: %v\n", err)
+		}
 	} else {
 		if flag.NArg() == 0 {
 			return nil
 		}
-		files = flag.Args()
+		for _, a := range flag.Args() {
+			if strings.TrimSpace(a) != "" {
+				files = append(files, a)
+			}
+		}
 	}
 	return files
+}
+
+// resultKeys maps each input file to its JSON output key: the basename,
+// unless basenames collide, in which case the full path keeps both results.
+func resultKeys(files []string) []string {
+	counts := make(map[string]int)
+	for _, f := range files {
+		counts[filepath.Base(f)]++
+	}
+	keys := make([]string, len(files))
+	for i, f := range files {
+		if counts[filepath.Base(f)] > 1 {
+			keys[i] = f
+		} else {
+			keys[i] = filepath.Base(f)
+		}
+	}
+	return keys
+}
+
+// joinOrdered joins per-chunk texts, skipping empty slots left by silent
+// or failed chunks so no double spaces appear.
+func joinOrdered(texts []string) string {
+	parts := make([]string, 0, len(texts))
+	for _, t := range texts {
+		if trimmed := strings.TrimSpace(t); trimmed != "" {
+			parts = append(parts, trimmed)
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 func uniqueFiles(files []string) []string {
 	seen := make(map[string]bool)
 	var unique []string
 	for _, f := range files {
-		if !seen[f] {
-			seen[f] = true
-			unique = append(unique, f)
+		clean := filepath.Clean(f)
+		if !seen[clean] {
+			seen[clean] = true
+			unique = append(unique, clean)
 		}
 	}
 	return unique
@@ -394,7 +521,7 @@ Usage:
 
 Options:
   -lang string
-        Language code (default matches -voice)
+        Language code (STT default "en-US"; TTS default matches -voice)
   -voice string
         TTS voice name (default "en-US-Casual-K")
         Voices: https://docs.cloud.google.com/text-to-speech/docs/list-voices-and-types

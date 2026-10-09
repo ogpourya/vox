@@ -53,7 +53,7 @@ anything else is spoken as text.
 
 | Flag      | Default           | Description                                        |
 |-----------|-------------------|----------------------------------------------------|
-| `-lang`   | matches `-voice`  | Language code, e.g. `en-US`, `fr-FR`               |
+| `-lang`   | `en-US` / `-voice` | Language code: STT default `en-US`, TTS default matches `-voice` |
 | `-voice`  | `en-US-Casual-K`  | TTS voice name                                     |
 | `-rate`   | `1.0`             | TTS speaking rate, `0.25`–`4.0`                    |
 | `-o`      | `output.mp3`      | TTS output file (saves instead of playing)         |
@@ -71,5 +71,6 @@ and a warning is printed.
 ## Notes
 
 - No API key is required; both directions share a built-in key with rate
-  limits. Heavy use may return quota errors — retry later.
+  limits. Heavy use may return quota errors — retry later. Override with
+  `VOX_GOOGLE_API_KEY`.
 - Tests: `./test.sh` (requires network access for the Google endpoints).

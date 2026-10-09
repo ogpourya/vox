@@ -27,6 +27,10 @@ go.work.sum
 # env file
 .env
 
+# vox artifacts: default TTS output and locally built binary
+output.mp3
+/vox
+
 # Editor/IDE
 # .idea/
 # .vscode/
